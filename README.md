@@ -122,7 +122,10 @@ mistakes waiting for you:
    Reserve 502 for your RPC actually being down.
 4. **Replay defense must search history, not the status cache.** The
    recent-status cache spans ~1 minute; a replay 5 minutes later slips
-   past it. Use `searchTransactionHistory: true` and answer 409.
+   past it. Use `searchTransactionHistory: true` and answer 409. (This is
+   a robustness choice, not a conformance requirement: x402 v2 §10.1 places
+   replay defence at the authorization nonce and the token contract, so
+   `x402-svm-check.js` does not flag an endpoint that re-serves a replay.)
 5. **Cap the fee you'll co-sign** (`MAX_FEE_LAMPORTS`): the client chooses
    the compute-budget instructions, and you sign whatever they chose.
 6. **Hard deadline on the settlement RPC leg.** web3.js fetches have no

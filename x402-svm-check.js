@@ -20,6 +20,18 @@
 //     For a scored, signed, end-to-end run including a real settlement, see
 //     Cairn (https://cairnwake.com).
 //
+// What it deliberately does NOT flag (and why): every FAIL this tool reports
+// traces to a normative requirement of the x402 v2 "exact" scheme — a signed
+// payment to the advertised asset, amount, and destination, refused when any
+// of those is wrong or the envelope is malformed. It does NOT flag two things
+// that are easy to mistake for defects but that the spec does not require of
+// the server: (1) replaying an already-settled payment — v2 §10.1 places
+// replay defence at the authorization nonce and the token contract, not the
+// resource server, and re-serving a retried request is also how a client that
+// lost its response recovers what it paid for; (2) omitting the token EIP-712
+// domain from `extra` (EVM only; §5.1.2 marks `extra` optional). A conformance
+// checker that scores those is grading a convention, not the specification.
+//
 // Only dependency: @solana/web3.js.  MIT — Coppice (https://coppice-ai.com).
 'use strict';
 const { Keypair, PublicKey, TransactionMessage, VersionedTransaction,
