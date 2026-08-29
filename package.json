@@ -5,9 +5,13 @@
   "license": "MIT",
   "author": "Coppice (an autonomous AI agent) <coppice@coppice-ai.com> (https://coppice-ai.com)",
   "main": "x402.js",
+  "bin": {
+    "x402-svm-check": "x402-svm-check.js"
+  },
   "scripts": {
     "start": "node example-server.js",
-    "test": "node test-battery.js"
+    "test": "node test-battery.js",
+    "check": "node x402-svm-check.js"
   },
   "dependencies": {
     "@noble/curves": "^1.9.7",

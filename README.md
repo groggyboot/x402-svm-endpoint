@@ -22,6 +22,7 @@ and confirms — one round trip, atomic settlement.
 | `x402.js` | the whole scheme: requirements/402 header, validation, settlement (~300 lines, self-contained) |
 | `example-server.js` | smallest correct wiring — one paid POST endpoint |
 | `test-battery.js` | 17-check local conformance battery (a superset of the 13 Cairn scored) |
+| `x402-svm-check.js` | **generic** conformance checker — point it at *any* SVM x402 endpoint URL and it drives the battery from that endpoint's own advertised requirements |
 
 ## Quick start
 
@@ -46,6 +47,46 @@ simulation and your endpoint is broken in a way none of your rejection
 tests will show — this "rail-cannot-receive" defect is the most common
 failure class on Cairn's scoreboard, and it cost this very endpoint its
 first conformance run. `test-battery.js` checks it on-chain.
+
+## Check any endpoint (no setup, no funds)
+
+`x402-svm-check.js` is a standalone checker for auditing a *running* SVM
+x402 endpoint — yours or anyone's. It reads the endpoint's own 402
+response, extracts the advertised `exact`-scheme requirements (network,
+asset, amount, payTo, fee payer), builds a battery of hostile payloads
+from them, and reports whether each is correctly refused. It also checks
+on-chain that the advertised `payTo` can actually **receive** the asset.
+
+```sh
+npm install
+node x402-svm-check.js https://your-endpoint.example/api/pay
+```
+
+```
+CHECK                         VERDICT  DETAIL
+no_payment                    PASS     402 payment_required
+garbage_transaction           PASS     402 undeserializable_transaction
+unsigned_transaction          PASS     402 payer_signature_missing
+forged_signature              PASS     402 payer_signature_invalid
+wrong_asset                   PASS     402 wrong_asset
+wrong_amount_underpay         PASS     402 wrong_amount
+wrong_destination             PASS     402 wrong_destination
+extra_instruction             PASS     402 unexpected_instruction_program
+fee_payer_ata_as_source       PASS     402 fee_payer_must_not_move_funds
+receive_rail_exists           PASS     destination token account …  exists
+```
+
+Nothing is broadcast on-chain: every hostile transaction is signed by a
+throwaway keypair against a fake blockhash and only sent to your HTTP
+endpoint. It tests the **rejection path** and the **receive rail** — the
+two defect classes (`hostile-payload-accepted`, `rail-cannot-receive`)
+that a self-test against your own code will miss. It does **not** send a
+real payment, so a clean run is necessary but not sufficient; for a
+scored end-to-end run with a live settlement, see
+[Cairn](https://cairnwake.com).
+
+Env: `X402_HEADER` (payment header name, default `X-PAYMENT`), `X402_RPC`,
+`X402_METHOD` (default `POST`).
 
 ## Configuration (env)
 
