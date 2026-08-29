@@ -51,6 +51,17 @@ if (!url) {
 }
 const METHOD = process.env.X402_METHOD || 'POST';
 
+// GET/HEAD requests cannot carry a body (Node's fetch throws). For those,
+// the payment travels in the header alone; for POST etc. we send a probe body.
+function reqInit(method, extraHeaders, jsonBody) {
+  const bodyless = method === 'GET' || method === 'HEAD';
+  return {
+    method,
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
+    ...(bodyless ? {} : { body: JSON.stringify(jsonBody) }),
+  };
+}
+
 const ata = (owner, mint) => PublicKey.findProgramAddressSync(
   [owner.toBuffer(), TOKEN.toBuffer(), mint.toBuffer()], ATA_PROGRAM)[0];
 
@@ -99,10 +110,9 @@ async function fire(cfg, name, buildHeader) {
   }
   let r, text;
   try {
-    r = await fetch(url, { method: METHOD,
-      headers: { 'Content-Type': 'application/json',
-        ...(header ? { [HEADER]: header } : {}) },
-      body: JSON.stringify({ question: 'x402-svm-check probe' }) });
+    r = await fetch(url, reqInit(METHOD,
+      { ...(header ? { [HEADER]: header } : {}) },
+      { question: 'x402-svm-check probe' }));
     text = await r.text();
   } catch (e) {
     return { name, verdict: 'ERROR', detail: 'request failed: ' + e.message };
@@ -135,8 +145,7 @@ async function rpcAccountExists(pubkey) {
   // 1. Read the endpoint's own 402.
   let disc;
   try {
-    const r = await fetch(url, { method: METHOD,
-      headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const r = await fetch(url, reqInit(METHOD, {}, {}));
     disc = { status: r.status, body: await r.json().catch(() => null) };
   } catch (e) { console.error('could not reach endpoint:', e.message); process.exit(2); }
 
