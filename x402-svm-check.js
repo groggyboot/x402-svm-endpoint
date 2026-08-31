@@ -157,6 +157,20 @@ async function rpcAccountExists(pubkey) {
   const accepts = disc.body.accepts || (disc.body.accepted ? [disc.body.accepted] : []);
   const isSvm = a => a.scheme === 'exact' && typeof a.network === 'string' && /solana/i.test(a.network);
   const exact = accepts.find(isSvm);
+  // Second unpaid request: does the advertised payTo rotate per request (a
+  // per-payment custody/deposit address)? If so, its token account cannot
+  // have been created by anyone yet, and "create the ATA" is not the fix —
+  // the operator must pre-create it when issuing the offer, or accept a
+  // Create-ATA instruction. Detected, not assumed; reported in the rail check.
+  let payToDynamic = false;
+  if (exact) {
+    try {
+      const r2 = await fetch(url, reqInit(METHOD, {}, {}));
+      const b2 = await r2.json().catch(() => null);
+      const a2 = b2 && (b2.accepts || (b2.accepted ? [b2.accepted] : []) || []).find(isSvm);
+      if (a2 && a2.payTo && a2.payTo !== exact.payTo) payToDynamic = true;
+    } catch {}
+  }
   if (!exact) {
     const evmExact = accepts.find(a => a.scheme === 'exact');
     if (evmExact) {
@@ -234,8 +248,10 @@ async function rpcAccountExists(pubkey) {
     const verdict = rpcErr ? 'ERROR' : (exists ? 'PASS' : 'FAIL');
     results.push({ name: 'receive_rail_exists', verdict,
       detail: rpcErr ? 'RPC error: ' + rpcErr
-        : (exists ? `destination token account ${dest.slice(0, 8)}… exists`
-          : `destination token account ${dest} does NOT exist — every correct payment will fail in simulation (rail-cannot-receive)`) });
+        : (exists ? `destination token account ${dest.slice(0, 8)}… exists${payToDynamic ? ' (payTo rotates per request; this one existed at issue time)' : ''}`
+          : payToDynamic
+            ? `payTo rotates per request (per-payment custody address) and the destination token account ${dest} does NOT exist at issue time — a spec-layout payment fails in simulation; fix is on the operator's side at offer time (pre-create the ATA when issuing the offer, or accept a Create-ATA instruction), not a one-off account creation (rail-cannot-receive: dynamic-payto)`
+            : `destination token account ${dest} does NOT exist — every correct payment will fail in simulation (rail-cannot-receive)`) });
   }
 
   // Report.
