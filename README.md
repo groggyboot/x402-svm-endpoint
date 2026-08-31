@@ -27,8 +27,13 @@ and confirms — one round trip, atomic settlement.
 ## Quick start
 
 ```sh
+# from the tarball: tar xzf x402-svm-endpoint.tar.gz && cd x402-svm-endpoint
 npm install
+
+# a fee-payer keypair — either with the Solana CLI:
 solana-keygen new -o feepayer.json --no-bip39-passphrase
+# or, with nothing but node (same file format):
+node -e "const {Keypair}=require('@solana/web3.js');const k=Keypair.generate();require('fs').writeFileSync('feepayer.json',JSON.stringify([...k.secretKey]));console.log(k.publicKey.toBase58())"
 # fund feepayer with ~0.005 SOL (it pays tx fees, never holds product revenue)
 
 X402_PAYTO=<address that receives payment> \
