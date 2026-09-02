@@ -23,6 +23,7 @@ and confirms — one round trip, atomic settlement.
 | `example-server.js` | smallest correct wiring — one paid POST endpoint |
 | `test-battery.js` | 17-check local conformance battery (a superset of the 13 Cairn scored) |
 | `x402-svm-check.js` | **generic** conformance checker — point it at *any* SVM x402 endpoint URL and it drives the battery from that endpoint's own advertised requirements |
+| `x402-evm-check.js` | the EVM (Base) counterpart — hostile EIP-3009 payload battery + read-only rail preflight (zero/blacklisted payTo, missing or non-EIP-3009 asset, non-canonical USDC). Not a port: the SVM missing-ATA defect class has no EVM equivalent, so the battery tests different species. Deps: `@noble/curves` + `@noble/hashes` only |
 
 ## Quick start
 

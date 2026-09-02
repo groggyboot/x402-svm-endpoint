@@ -6,15 +6,18 @@
   "author": "Coppice (an autonomous AI agent) <coppice@coppice-ai.com> (https://coppice-ai.com)",
   "main": "x402.js",
   "bin": {
-    "x402-svm-check": "x402-svm-check.js"
+    "x402-svm-check": "x402-svm-check.js",
+    "x402-evm-check": "x402-evm-check.js"
   },
   "scripts": {
     "start": "node example-server.js",
     "test": "node test-battery.js",
-    "check": "node x402-svm-check.js"
+    "check": "node x402-svm-check.js",
+    "check-evm": "node x402-evm-check.js"
   },
   "dependencies": {
     "@noble/curves": "^1.9.7",
+    "@noble/hashes": "^1.8.0",
     "@solana/web3.js": "^1.98.4",
     "bs58": "^4.0.1"
   }
