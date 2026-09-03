@@ -132,6 +132,18 @@ async function fire(cfg, name, buildHeader) {
     (verdict === 'WEAK' && r.status >= 500 ? ' (5xx: validate before hitting infra)' : '') };
 }
 
+// Some servers put the x402 envelope in the response BODY, others carry it
+// base64-encoded in a PAYMENT-REQUIRED header beside an empty body (both are
+// live in the wild — agent402.tools does the latter). Read both.
+function termsOf(body, headers) {
+  if (body && (body.accepts || body.accepted))
+    return body.accepts || [body.accepted];
+  const h = headers && headers.get && headers.get('payment-required');
+  if (h) { try { const j = JSON.parse(Buffer.from(h, 'base64').toString('utf8'));
+    if (j && (j.accepts || j.accepted)) return j.accepts || [j.accepted]; } catch {} }
+  return [];
+}
+
 async function rpcAccountExists(pubkey) {
   const r = await fetch(RPC, { method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -146,15 +158,15 @@ async function rpcAccountExists(pubkey) {
   let disc;
   try {
     const r = await fetch(url, reqInit(METHOD, {}, {}));
-    disc = { status: r.status, body: await r.json().catch(() => null) };
+    disc = { status: r.status, body: await r.json().catch(() => null), headers: r.headers };
   } catch (e) { console.error('could not reach endpoint:', e.message); process.exit(2); }
 
-  if (disc.status < 400 || !disc.body) {
-    console.error(`endpoint did not answer a JSON 402 to an unpaid ${METHOD} (got ${disc.status}). ` +
+  if (disc.status < 400) {
+    console.error(`endpoint did not answer a 402/4xx to an unpaid ${METHOD} (got ${disc.status}). ` +
       'Is this the paid endpoint URL?');
     process.exit(2);
   }
-  const accepts = disc.body.accepts || (disc.body.accepted ? [disc.body.accepted] : []);
+  const accepts = termsOf(disc.body, disc.headers);
   const isSvm = a => a.scheme === 'exact' && typeof a.network === 'string' && /solana/i.test(a.network);
   const exact = accepts.find(isSvm);
   // Second unpaid request: does the advertised payTo rotate per request (a
@@ -167,7 +179,7 @@ async function rpcAccountExists(pubkey) {
     try {
       const r2 = await fetch(url, reqInit(METHOD, {}, {}));
       const b2 = await r2.json().catch(() => null);
-      const a2 = b2 && (b2.accepts || (b2.accepted ? [b2.accepted] : []) || []).find(isSvm);
+      const a2 = termsOf(b2, r2.headers).find(isSvm);
       if (a2 && a2.payTo && a2.payTo !== exact.payTo) payToDynamic = true;
     } catch {}
   }
