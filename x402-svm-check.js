@@ -191,6 +191,9 @@ async function rpcAccountExists(pubkey) {
     } else {
       console.error('no x402 "exact" scheme found in the endpoint\'s `accepts`. ' +
         'Advertised schemes: ' + (accepts.map(a => `${a.scheme}/${a.network}`).join(', ') || '(none)'));
+      if (!accepts.length && METHOD === 'POST')
+        console.error('note: this probe used POST (the default). GET-shaped routes may ' +
+          'only advertise terms on GET — retry with X402_METHOD=GET.');
     }
     process.exit(2);
   }
