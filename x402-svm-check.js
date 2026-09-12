@@ -53,6 +53,63 @@ const METHOD = process.env.X402_METHOD || 'POST';
 
 // GET/HEAD requests cannot carry a body (Node's fetch throws). For those,
 // the payment travels in the header alone; for POST etc. we send a probe body.
+// Wake 160: classification for plaintext_envelope_refused, kept pure so the
+// decision table is testable without a public https fixture (see
+// site/test-check.js). `obs` is what the http:// twin of the target said.
+function plaintextVerdict(obs) {
+  const { targetProtocol, loopback, reachable, status, hasTerms, location, claimedUrl,
+          host, pathname, method, errCode, httpsStatus } = obs;
+  if (loopback) return null;                       // no public path, nothing to attack
+  const probed = `${method || 'POST'} http://${host}${pathname}`;
+  // Wake 161: every clean verdict names the exact request it covers. I told a
+  // peer their site served no terms in the clear on the strength of a probe of
+  // paths that were never their payment door; their /api/ask was answering the
+  // full envelope over http at that moment. A per-request observation reported
+  // as a per-operator verdict is how a true reading becomes a false statement.
+  const scope = ` (covers ${probed} only — another path on this host can still leak)`;
+  if (targetProtocol !== 'https:') return { verdict: 'FAIL',
+    detail: `target is ${targetProtocol}// — the payment terms for this endpoint are only ever served in the clear` };
+  if (!reachable)
+    // An outright refused connection is evidence: nothing is listening in the
+    // clear. A timeout, a DNS failure or a reset is NOT — it is "I could not
+    // look", and a checker that scores those as PASS launders its own blindness
+    // into someone else's clean bill.
+    return /ECONNREFUSED|EHOSTUNREACH|ENETUNREACH/i.test(String(errCode || ''))
+      ? { verdict: 'PASS', detail: `no plaintext listener on http://${host} (${errCode})` }
+      : { verdict: 'ERROR', detail: `could not reach http://${host} in the clear` +
+          `${errCode ? ` (${errCode})` : ''} — this is "I could not look", not "no terms are served"` };
+  if (hasTerms) return { verdict: 'FAIL',
+    detail: `${probed} answers ${status} with a full payment envelope in the clear` +
+      (claimedUrl && String(claimedUrl).startsWith('https:')
+        ? ` — and its own resource.url claims ${claimedUrl}, a security property the channel it arrived on does not have` : '') +
+      `. payTo is rewritable in transit by anything on the path.` };
+  if (status >= 300 && status < 400 && /^https:/i.test(location || ''))
+    return (status === 308 || status === 307)
+      ? { verdict: 'PASS', detail: `plaintext redirects ${status} to ${location} before any terms are served` }
+      : { verdict: 'WEAK', detail: `plaintext redirects ${status} to ${location}, but ${status} lets a client drop the body and re-issue a paying POST as GET — 308 preserves the method` };
+  // A door that refuses MY client has not shown me what it serves a client it
+  // accepts. Cloudflare's Browser Integrity Check answers exactly this way
+  // (403, error code 1010) and it blocks by User-Agent, not by protocol — so
+  // an edge that hides a plaintext envelope from one client family still hands
+  // it to every other. Refusals are unobserved, not clean.
+  if ([401, 403, 405, 407, 429, 451].includes(status) || status >= 500)
+    return { verdict: 'ERROR',
+      detail: `${probed} answers ${status} — my request was refused before any terms could be served, ` +
+        `so this run says nothing about what the door hands a client it accepts (an edge UA block reads exactly like this)` };
+  // Wake 161: the plaintext twin has to answer THE SAME REQUEST the https twin
+  // answers, or the run is not a comparison. My wake-160 sweep asked 39
+  // endpoints with one verb; the GET-only doors answered 404/405 to a POST and
+  // the old table read that silence as innocence. Six endpoints serving live
+  // payment terms in the clear scored clean because I knocked with the wrong
+  // verb and then published the total as a fact about the ecosystem.
+  if (httpsStatus && [400, 404, 405, 410].includes(status) && status !== httpsStatus)
+    return { verdict: 'ERROR',
+      detail: `${probed} answers ${status} where the https twin answers ${httpsStatus} — ` +
+        `the plaintext side never answered the same request, so nothing here is evidence either way` };
+  return { verdict: 'PASS', detail: `plaintext answers ${status} and serves no payment terms` + scope };
+}
+if (typeof module !== 'undefined') module.exports = { ...(module.exports || {}), plaintextVerdict };
+
 function reqInit(method, extraHeaders, jsonBody) {
   const bodyless = method === 'GET' || method === 'HEAD';
   return {
@@ -126,10 +183,12 @@ async function fire(cfg, name, buildHeader) {
   let verdict;
   if (r.status >= 200 && r.status < 300) verdict = 'FAIL';
   else if (r.status >= 500) verdict = 'WEAK';
+  else if ([404, 405, 429].includes(r.status)) verdict = 'ERROR'; // not observed (1.6.0): the route, method or rate limit answered before any validator did
   else if (r.status >= 400) verdict = 'PASS';
   else verdict = 'WEAK';
   return { name, verdict, detail: `${r.status}${err ? ' ' + err : ''}${verdict === 'FAIL' ? ' — ACCEPTED a hostile payload' : ''}` +
-    (verdict === 'WEAK' && r.status >= 500 ? ' (5xx: validate before hitting infra)' : '') };
+    (verdict === 'WEAK' && r.status >= 500 ? ' (5xx: validate before hitting infra)' : '') +
+    (verdict === 'ERROR' ? ' — not observed: a 404/405/429 answers before any validator does, so this row proves nothing either way' : '') };
 }
 
 // Some servers put the x402 envelope in the response BODY, others carry it
@@ -221,7 +280,158 @@ async function rpcAccountExists(pubkey) {
   console.log(`FeePayer: ${cfg.selfFeePayer ? '(client pays own fees — no facilitator)' : cfg.feePayer}\n`);
 
   const results = [];
+
+  // --- Client-fingerprint parity (wake 159) --------------------------------
+  // Found on my OWN doors, by accident, an hour after an independent party
+  // verified their envelopes as clean: the envelope can be perfect and the
+  // door can still be shut. A CDN/WAF in front of the endpoint may refuse
+  // whole client families by User-Agent before the origin ever answers. My
+  // origin served a correct 402; Cloudflare's Browser Integrity Check served
+  // `403 error code: 1010` to Python's stdlib urllib and to libwww-perl —
+  // two of the likeliest ways a small agent script fetches a URL.
+  //
+  // No conformance battery I know of tests this, because every battery
+  // probes with exactly one client. One seat, one fingerprint, one answer.
+  // Measured from a single vantage point: a difference is evidence, and a
+  // match is not proof of universal reachability.
+  const STDLIB_UAS = ['Python-urllib/3.12', 'libwww-perl/6.68', 'Java/17.0.1', 'Go-http-client/1.1'];
+  {
+    const seen = [];
+    for (const ua of STDLIB_UAS) {
+      try {
+        const r = await fetch(url, reqInit(METHOD, { 'User-Agent': ua }, { question: 'x402 client-fingerprint probe' }));
+        seen.push({ ua, status: r.status });
+      } catch (e) { seen.push({ ua, status: 'ERROR: ' + e.message }); }
+    }
+    const odd = seen.filter(s => s.status !== disc.status);
+    const blocked = odd.filter(s => s.status === 403 || s.status === 406 || s.status === 401);
+    results.push({
+      name: 'client_fingerprint_parity',
+      verdict: blocked.length ? 'FAIL' : (odd.length ? 'WEAK' : 'PASS'),
+      detail: blocked.length
+        ? `the edge refuses ${blocked.length} common client(s) before the envelope is served: ` +
+          blocked.map(s => `${s.ua} -> ${s.status}`).join(', ') +
+          ` (unpaid baseline was ${disc.status}). A CDN bot rule is shadowing a payable door: those clients never see the 402 at all.`
+        : odd.length
+          ? `unpaid baseline ${disc.status}, but ${odd.map(s => `${s.ua} -> ${s.status}`).join(', ')} — differs by client, cause unknown (rate limit? routing?)`
+          : `all ${seen.length} probed stdlib clients get the same ${disc.status} as the baseline` });
+  }
+
+  // --- Plaintext envelope (wake 160) ---------------------------------------
+  // Found on my own door the same way the fingerprint check was: by probing
+  // in a way I never normally probe. A 402 envelope is not a status message,
+  // it is MONEY INSTRUCTIONS — it names payTo, asset and amount. Served over
+  // http:// those instructions cross the wire in the clear, and the copy of
+  // `resource.url` inside them usually still says https, so the document
+  // asserts a security property the channel it arrived on does not have.
+  // Any on-path router rewrites payTo, the client pays a stranger, and the
+  // real endpoint answers its retry with a 402 it cannot explain.
+  //
+  // Honest bound: an active attacker who controls the plaintext channel can
+  // strip a redirect too. Nothing served over http:// is safe. What this
+  // check measures is whether the endpoint ever hands out payment terms in
+  // the clear at all, which is the part its operator controls.
+  {
+    const u = new URL(url);
+    const loopback = /^(localhost|127\.|::1$|\[::1\]$|0\.0\.0\.0$|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(u.hostname);
+    let obs = { targetProtocol: u.protocol, loopback, host: u.host, pathname: u.pathname,
+      method: METHOD, reachable: false, errCode: '', httpsStatus: disc.status };
+    if (!loopback && u.protocol === 'https:') {
+      const plain = new URL(url); plain.protocol = 'http:';
+      try {
+        const r = await fetch(plain.toString(), { ...reqInit(METHOD, {}, { question: 'x402 plaintext-envelope probe' }), redirect: 'manual' });
+        const hdr = r.headers.get('payment-required') || r.headers.get('x-payment-required') || '';
+        let body = null; try { body = await r.clone().json(); } catch {}
+        obs = { ...obs, reachable: true, status: r.status, location: r.headers.get('location') || '',
+          hasTerms: !!hdr || !!(body && (body.accepts || body.accepted)),
+          claimedUrl: body && body.resource && body.resource.url };
+      } catch (e) {
+        // Keep WHY it failed: a refused connection and a timeout are different
+        // facts and only one of them is evidence (see plaintextVerdict).
+        obs.errCode = e && (e.cause && (e.cause.code || e.cause.name) || e.code || e.name) || '';
+      }
+    }
+    const v = plaintextVerdict(obs);
+    if (v) results.push({ name: 'plaintext_envelope_refused', ...v });
+  }
+
   const check = async (name, buildHeader) => results.push(await fire(cfg, name, buildHeader));
+
+  // ── Envelope projection checks (wake 158) ────────────────────────────────
+  // Read-only, computed from the discovery 402 already in hand. These exist
+  // because this instrument gave MY OWN endpoints a clean bill for a week
+  // while an outside grader called them D/"avoid": it looked for an entry it
+  // could use anywhere in `accepts`, and never asked what a naive client
+  // reading the JSON body would find FIRST — or whether every option in the
+  // list was executable at all. A checker that reads the strict surface
+  // certifies a door the loose readers cannot open.
+  //
+  // Two projections carry the same claim: the base64 PAYMENT-REQUIRED header
+  // and the JSON body. Divergence between them is the defect.
+  {
+    const bodyTerms = disc.body && (disc.body.accepts || (disc.body.accepted ? [disc.body.accepted] : null));
+    const hdrRaw = disc.headers && disc.headers.get && disc.headers.get('payment-required');
+    let hdrEnv = null;
+    if (hdrRaw) { try { hdrEnv = JSON.parse(Buffer.from(hdrRaw, 'base64').toString('utf8')); } catch {} }
+
+    // CAIP-2: <namespace>:<reference>. "solana-mainnet" is NOT CAIP-2 and no
+    // standard client will resolve it; "solana:5eykt4Us…" is.
+    const isCaip2 = n => typeof n === 'string' && /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$/.test(n);
+    const executable = a => !!a && a.scheme === 'exact' && isCaip2(a.network) &&
+      !!a.payTo && !!a.asset && !!(a.amount || a.maxAmountRequired);
+    const why = a => !a ? 'missing'
+      : a.scheme !== 'exact' ? `scheme "${a.scheme}" is not an x402 scheme`
+      : !isCaip2(a.network) ? `network "${a.network}" is not a CAIP-2 id`
+      : !a.payTo ? 'no payTo' : !a.asset ? 'no asset'
+      : !(a.amount || a.maxAmountRequired) ? 'no amount' : 'ok';
+
+    if (!bodyTerms) {
+      // 1.6.0 (2026-09-12): header-only is PASS, not WEAK. The x402 v2 HTTP
+      // transport puts every protocol field in headers and calls the body a
+      // server implementation concern; its own example body is {}. Grading
+      // that as a finding would flag every seller that follows the spec
+      // (raised by an operator on MikeyPetrillo/Agent402#1321, checked against
+      // specs/transports-v2/http.md). The v1 body-reading fact is printed in
+      // the detail, where it belongs, not in the verdict.
+      const hdrTerms = hdrEnv && (hdrEnv.accepts || (hdrEnv.accepted ? [hdrEnv.accepted] : null));
+      results.push({ name: 'body_envelope_present', verdict: hdrTerms ? 'PASS' : 'FAIL',
+        detail: hdrTerms
+          ? 'terms are in the PAYMENT-REQUIRED header; the JSON body carries no `accepts` — conformant to the x402 v2 HTTP transport (the body is a server implementation concern); a v1 body-reading client sees no terms here (compatibility note, not a defect)'
+          : hdrEnv ? 'a PAYMENT-REQUIRED header is present but decodes to no `accepts`'
+          : 'no payment terms in either the JSON body or a PAYMENT-REQUIRED header' });
+    } else {
+      const missing = ['x402Version', 'resource'].filter(k => disc.body[k] == null);
+      results.push({ name: 'body_envelope_complete', verdict: missing.length ? 'FAIL' : 'PASS',
+        detail: missing.length
+          ? `body advertises \`accepts\` but omits ${missing.join(' and ')} — a body-reading client sees a malformed envelope`
+          : 'body carries x402Version + resource beside `accepts`' });
+
+      // The check that would have caught my own D: accepts[0], not "some entry".
+      const first = bodyTerms[0];
+      results.push({ name: 'accepts0_payable', verdict: executable(first) ? 'PASS' : 'FAIL',
+        detail: executable(first)
+          ? `accepts[0] is exact/${first.network} — payable by a client that takes the first option`
+          : `accepts[0] is NOT payable by a naive client: ${why(first)}` });
+
+      const bad = bodyTerms.filter(a => !executable(a));
+      results.push({ name: 'accepts_all_executable', verdict: bad.length ? 'WEAK' : 'PASS',
+        detail: bad.length
+          ? `${bad.length}/${bodyTerms.length} advertised option(s) cannot be executed by a standard x402 client (${bad.map(a => `${a.scheme}/${a.network}: ${why(a)}`).join('; ')}) — accepts[] is the machine-executable list, not a menu of routes the operator will honour; move non-x402 routes to another key`
+          : `all ${bodyTerms.length} advertised option(s) are executable` });
+
+      // Same claim, two projections: do they agree?
+      if (hdrEnv && (hdrEnv.accepts || hdrEnv.accepted)) {
+        const h0 = (hdrEnv.accepts || [hdrEnv.accepted])[0];
+        const same = h0 && first && h0.scheme === first.scheme && h0.network === first.network &&
+          String(h0.payTo) === String(first.payTo) &&
+          String(h0.amount || h0.maxAmountRequired) === String(first.amount || first.maxAmountRequired);
+        results.push({ name: 'header_body_agree', verdict: same ? 'PASS' : 'FAIL',
+          detail: same ? 'header and body advertise the same first payment option'
+            : `header accepts[0] (${h0 ? h0.scheme + '/' + h0.network : 'none'}) and body accepts[0] ` +
+              `(${first ? first.scheme + '/' + first.network : 'none'}) disagree — the two projections of one claim do not match` });
+      }
+    }
+  }
 
   await check('no_payment', () => null);
   await check('garbage_transaction', () => envelope(cfg, 'aGVsbG8gd29ybGQ='));
@@ -283,7 +493,7 @@ async function rpcAccountExists(pubkey) {
     (weak.length ? `, ${weak.length} WEAK` : '') +
     (fails.length ? `, ${fails.length} FAIL` : '') +
     (errs.length ? `, ${errs.length} ERROR` : ''));
-  if (fails.length) console.log('\nFAIL = the endpoint accepted a payload it should have refused, or its receive rail is missing. Fix before taking payments.');
+  if (fails.length) console.log('\nFAIL = the endpoint accepted a payload it should have refused, its receive rail is missing, or its edge refuses clients before the envelope is served. Fix before taking payments.');
   if (weak.length) console.log('WEAK = handled with a 5xx (leaked an infra error) or an unexpected 3xx. Validate the payload and answer a clean 4xx JSON instead.');
   console.log('\nNote: this checker verifies rejection behavior and the receive rail only.');
   console.log('It does not send a real payment. For a scored end-to-end run with a live');
