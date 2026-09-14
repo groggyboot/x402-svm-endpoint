@@ -194,12 +194,24 @@ async function fire(cfg, name, buildHeader) {
 // Some servers put the x402 envelope in the response BODY, others carry it
 // base64-encoded in a PAYMENT-REQUIRED header beside an empty body (both are
 // live in the wild — agent402.tools does the latter). Read both.
+// 1.7.0 (2026-09-14): the header may be spelled PAYMENT-REQUIRED (v2) or
+// X-Payment-Required, and carry base64 JSON or plain JSON — all four are live
+// (a swarmboard reviewer found a plain-JSON X-Payment-Required door that this
+// decoder read as "no header"). Decode every case; report which was used.
+function decodeEnvelopeHeader(headers) {
+  if (!headers || !headers.get) return null;
+  for (const name of ['payment-required', 'x-payment-required']) {
+    const raw = headers.get(name); if (!raw) continue;
+    try { const j = JSON.parse(Buffer.from(raw, 'base64').toString('utf8')); if (j && typeof j === 'object') return { env: j, name, encoding: 'base64' }; } catch {}
+    try { const j = JSON.parse(raw); if (j && typeof j === 'object') return { env: j, name, encoding: 'json' }; } catch {}
+  }
+  return null;
+}
 function termsOf(body, headers) {
   if (body && (body.accepts || body.accepted))
     return body.accepts || [body.accepted];
-  const h = headers && headers.get && headers.get('payment-required');
-  if (h) { try { const j = JSON.parse(Buffer.from(h, 'base64').toString('utf8'));
-    if (j && (j.accepts || j.accepted)) return j.accepts || [j.accepted]; } catch {} }
+  const d = decodeEnvelopeHeader(headers);
+  if (d && (d.env.accepts || d.env.accepted)) return d.env.accepts || [d.env.accepted];
   return [];
 }
 
@@ -370,18 +382,29 @@ async function rpcAccountExists(pubkey) {
   // and the JSON body. Divergence between them is the defect.
   {
     const bodyTerms = disc.body && (disc.body.accepts || (disc.body.accepted ? [disc.body.accepted] : null));
-    const hdrRaw = disc.headers && disc.headers.get && disc.headers.get('payment-required');
-    let hdrEnv = null;
-    if (hdrRaw) { try { hdrEnv = JSON.parse(Buffer.from(hdrRaw, 'base64').toString('utf8')); } catch {} }
+    const hdrDec = decodeEnvelopeHeader(disc.headers);
+    const hdrEnv = hdrDec ? hdrDec.env : null;
+    const hdrHow = hdrDec ? `${hdrDec.name.toUpperCase()} (${hdrDec.encoding})` : 'PAYMENT-REQUIRED';
 
     // CAIP-2: <namespace>:<reference>. "solana-mainnet" is NOT CAIP-2 and no
     // standard client will resolve it; "solana:5eykt4Us…" is.
     const isCaip2 = n => typeof n === 'string' && /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$/.test(n);
-    const executable = a => !!a && a.scheme === 'exact' && isCaip2(a.network) &&
+    // 1.7.0 (2026-09-14): version-aware names. On an x402Version:1 body the
+    // spec's own network names ("base", "solana", …) are the conformant form;
+    // calling them non-CAIP-2 produced a false FAIL on six v1 doors in a week
+    // (browserbase, Solana Index, timzinin, …). A v2 body still owes CAIP-2.
+    const V1_NAMES = { base: 'eip155:8453', 'base-sepolia': 'eip155:84532', avalanche: 'eip155:43114',
+      'avalanche-fuji': 'eip155:43113', polygon: 'eip155:137', 'polygon-amoy': 'eip155:80002',
+      sei: 'eip155:1329', 'sei-testnet': 'eip155:1328', iotex: 'eip155:4689',
+      solana: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', 'solana-devnet': 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1' };
+    const bodyVer = disc.body && Number(disc.body.x402Version) || null;
+    const normNet = n => (typeof n === 'string' && V1_NAMES[n]) || n;
+    const netOk = n => isCaip2(n) || (bodyVer === 1 && !!V1_NAMES[n]);
+    const executable = a => !!a && a.scheme === 'exact' && netOk(a.network) &&
       !!a.payTo && !!a.asset && !!(a.amount || a.maxAmountRequired);
     const why = a => !a ? 'missing'
       : a.scheme !== 'exact' ? `scheme "${a.scheme}" is not an x402 scheme`
-      : !isCaip2(a.network) ? `network "${a.network}" is not a CAIP-2 id`
+      : !netOk(a.network) ? (bodyVer === 1 ? `network "${a.network}" is neither a v1 network name nor a CAIP-2 id` : `network "${a.network}" is not a CAIP-2 id (a v2 body owes CAIP-2)`)
       : !a.payTo ? 'no payTo' : !a.asset ? 'no asset'
       : !(a.amount || a.maxAmountRequired) ? 'no amount' : 'ok';
 
@@ -400,11 +423,15 @@ async function rpcAccountExists(pubkey) {
           : hdrEnv ? 'a PAYMENT-REQUIRED header is present but decodes to no `accepts`'
           : 'no payment terms in either the JSON body or a PAYMENT-REQUIRED header' });
     } else {
-      const missing = ['x402Version', 'resource'].filter(k => disc.body[k] == null);
+      // 1.7.0: a v1 body carries `resource` inside each accepts entry, not at
+      // the top level — "omits resource" failed to reproduce by hand six times
+      // on v1 doors before this line learned to look where v1 puts it.
+      const perOptionResource = bodyVer === 1 && bodyTerms.every(a => a && a.resource != null);
+      const missing = ['x402Version', 'resource'].filter(k => disc.body[k] == null && !(k === 'resource' && perOptionResource));
       results.push({ name: 'body_envelope_complete', verdict: missing.length ? 'FAIL' : 'PASS',
         detail: missing.length
           ? `body advertises \`accepts\` but omits ${missing.join(' and ')} — a body-reading client sees a malformed envelope`
-          : 'body carries x402Version + resource beside `accepts`' });
+          : (perOptionResource ? 'v1 body carries x402Version, and resource inside every accepts entry (where v1 puts it)' : 'body carries x402Version + resource beside `accepts`') });
 
       // The check that would have caught my own D: accepts[0], not "some entry".
       const first = bodyTerms[0];
@@ -422,11 +449,15 @@ async function rpcAccountExists(pubkey) {
       // Same claim, two projections: do they agree?
       if (hdrEnv && (hdrEnv.accepts || hdrEnv.accepted)) {
         const h0 = (hdrEnv.accepts || [hdrEnv.accepted])[0];
-        const same = h0 && first && h0.scheme === first.scheme && h0.network === first.network &&
+        // 1.7.0: compare the OPTION, not the dialect — a v2 header saying
+        // eip155:8453 and a v1 body saying "base" name one chain; a door that
+        // serves both versions is dual-serving, which is agreement.
+        const same = h0 && first && h0.scheme === first.scheme && normNet(h0.network) === normNet(first.network) &&
           String(h0.payTo) === String(first.payTo) &&
           String(h0.amount || h0.maxAmountRequired) === String(first.amount || first.maxAmountRequired);
+        const dual = same && h0.network !== first.network;
         results.push({ name: 'header_body_agree', verdict: same ? 'PASS' : 'FAIL',
-          detail: same ? 'header and body advertise the same first payment option'
+          detail: same ? (dual ? `header (${hdrHow}, ${h0.network}) and body (v${bodyVer || '?'}, ${first.network}) name the same option in two dialects — dual-serving, not a disagreement` : 'header and body advertise the same first payment option')
             : `header accepts[0] (${h0 ? h0.scheme + '/' + h0.network : 'none'}) and body accepts[0] ` +
               `(${first ? first.scheme + '/' + first.network : 'none'}) disagree — the two projections of one claim do not match` });
       }
