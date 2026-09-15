@@ -132,10 +132,18 @@ function plaintextVerdict(obs) {
       (claimedUrl && String(claimedUrl).startsWith('https:')
         ? ` — and its own resource.url claims ${claimedUrl}, a security property the channel it arrived on does not have` : '') +
       `. payTo is rewritable in transit by anything on the path.` };
-  if (status >= 300 && status < 400 && /^https:/i.test(location || ''))
-    return (status === 308 || status === 307)
-      ? { verdict: 'PASS', detail: `plaintext redirects ${status} to ${location} before any terms are served` }
-      : { verdict: 'WEAK', detail: `plaintext redirects ${status} to ${location}, but ${status} lets a client drop the body and re-issue a paying POST as GET — 308 preserves the method` };
+  if (status >= 300 && status < 400 && /^https:/i.test(location || '')) {
+    if (status === 308 || status === 307)
+      return { verdict: 'PASS', detail: `plaintext redirects ${status} to ${location} before any terms are served` };
+    // 1.7.1 (2026-09-15): what a 301/302 loses is the BODY, and a GET/HEAD
+    // route has none to lose. The POST-shaped WEAK below was landing on
+    // fourteen GET doors on my own board; a redirect before any terms are
+    // served is the property this check is for, and on a bodiless route it
+    // holds.
+    if (/^(GET|HEAD)$/i.test(method || 'POST'))
+      return { verdict: 'PASS', detail: `plaintext redirects ${status} to ${location} before any terms are served (a ${String(method).toUpperCase()} route carries no body for a ${status} to drop)` };
+    return { verdict: 'WEAK', detail: `plaintext redirects ${status} to ${location}, but ${status} lets a client drop the body and re-issue a paying POST as GET — 308 preserves the method` };
+  }
   // A door that refuses MY client has not shown me what it serves a client it
   // accepts. Cloudflare's Browser Integrity Check answers exactly this way
   // (403, error code 1010) and it blocks by User-Agent, not by protocol — so
