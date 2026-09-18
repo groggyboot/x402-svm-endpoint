@@ -167,6 +167,15 @@ function plaintextVerdict(obs) {
 }
 if (typeof module !== 'undefined') module.exports = { ...(module.exports || {}), plaintextVerdict };
 
+// 1.9.0 (2026-09-18): ONE body for every probe. Until today the baseline sent
+// {} and every later probe sent {"question": "…"}; a door with a strict input
+// validator answered 400 to the unknown key, and this file printed that as a
+// client difference (parity row) or as a rejected hostile payment (hostile
+// rows) when no payment validator had run. Each probe now varies exactly one
+// thing — the User-Agent, the payment header, or the scheme — and the body is
+// the one that produced the baseline answer. X402_BODY='{"k":"v"}' sets it for
+// doors that validate input before they quote a price.
+const PROBE_BODY = (() => { try { return process.env.X402_BODY ? JSON.parse(process.env.X402_BODY) : {}; } catch { return {}; } })();
 function reqInit(method, extraHeaders, jsonBody) {
   const bodyless = method === 'GET' || method === 'HEAD';
   return { method, headers: { 'Content-Type': 'application/json', ...extraHeaders },
@@ -184,7 +193,7 @@ async function fire(name, buildHeader) {
   let r; let text;
   try {
     r = await fetch(url, reqInit(METHOD, { ...(header ? { [HEADER]: header } : {}) },
-      { question: 'x402-evm-check probe' }));
+      PROBE_BODY));
     text = await r.text();
   } catch (e) { return { name, verdict: 'ERROR', detail: 'request failed: ' + e.message }; }
   let body = null; try { body = JSON.parse(text); } catch {}
@@ -228,7 +237,7 @@ function termsOf(body, headers) {
   // 1. Read the endpoint's own 402 — twice, to detect a rotating payTo.
   let disc;
   try {
-    const r = await fetch(url, reqInit(METHOD, {}, {}));
+    const r = await fetch(url, reqInit(METHOD, {}, PROBE_BODY));
     disc = { status: r.status, body: await r.json().catch(() => null), headers: r.headers };
   } catch (e) { console.error('could not reach endpoint:', e.message); process.exit(2); }
   if (disc.status < 400) {
@@ -262,7 +271,7 @@ function termsOf(body, headers) {
   }
   let payToDynamic = false;
   try {
-    const r2 = await fetch(url, reqInit(METHOD, {}, {}));
+    const r2 = await fetch(url, reqInit(METHOD, {}, PROBE_BODY));
     const b2 = await r2.json().catch(() => null);
     const a2 = termsOf(b2, r2.headers).find(isEvm);
     if (a2 && a2.payTo && exact.payTo && a2.payTo.toLowerCase() !== exact.payTo.toLowerCase()) payToDynamic = true;
@@ -323,12 +332,12 @@ function termsOf(body, headers) {
   // probes with exactly one client. One seat, one fingerprint, one answer.
   // Measured from a single vantage point: a difference is evidence, and a
   // match is not proof of universal reachability.
-  const STDLIB_UAS = ['Python-urllib/3.12', 'libwww-perl/6.68', 'Java/17.0.1', 'Go-http-client/1.1'];
+  const STDLIB_UAS = ['Python-urllib/3.12', 'libwww-perl/6.68', 'Java/17.0.1', 'Go-http-client/1.1', 'python-httpx/0.27'];
   {
     const seen = [];
     for (const ua of STDLIB_UAS) {
       try {
-        const r = await fetch(url, reqInit(METHOD, { 'User-Agent': ua }, { question: 'x402 client-fingerprint probe' }));
+        const r = await fetch(url, reqInit(METHOD, { 'User-Agent': ua }, PROBE_BODY));
         seen.push({ ua, status: r.status });
       } catch (e) { seen.push({ ua, status: 'ERROR: ' + e.message }); }
     }
@@ -343,7 +352,46 @@ function termsOf(body, headers) {
           ` (unpaid baseline was ${disc.status}). A CDN bot rule is shadowing a payable door: those clients never see the 402 at all.`
         : odd.length
           ? `unpaid baseline ${disc.status}, but ${odd.map(s => `${s.ua} -> ${s.status}`).join(', ')} — differs by client, cause unknown (rate limit? routing?)`
-          : `all ${seen.length} probed stdlib clients get the same ${disc.status} as the baseline` });
+          : `all ${seen.length} probed User-Agents get the same ${disc.status} as the baseline (a User-Agent comparison from one network seat, not a client fingerprint)` });
+  }
+
+  // --- Discovery-document parity (1.9.0, 2026-09-18) ------------------------
+  // Put to me by an operator (credit, at his written request: Matt Baker,
+  // url2md.io) and argued again by a second one: a zone-wide bot rule refuses
+  // the documents that ADVERTISE a door as readily as the door itself, and the
+  // parity row above reads only the priced route. An agent that cannot read
+  // /.well-known/x402, /openapi.json or /llms.txt never learns the door exists.
+  // Each document the default client can read (200) is re-read under the two
+  // User-Agents this battery has actually seen refused in the wild. WEAK, not
+  // FAIL: the payable route is graded by its own row. A door with none of the
+  // three passes vacuously, and the detail says so.
+  {
+    const DOC_PATHS = ['/.well-known/x402', '/openapi.json', '/llms.txt'];
+    const DOC_UAS = ['Python-urllib/3.12', 'libwww-perl/6.68'];
+    const origin = new URL(url).origin;
+    const found = []; const refused = []; let errs = 0;
+    for (const p of DOC_PATHS) {
+      let base;
+      try { const r = await fetch(origin + p, { redirect: 'follow' }); base = r.status; await r.arrayBuffer().catch(() => null); }
+      catch (e) { errs++; continue; }
+      if (base !== 200) continue;
+      found.push(p);
+      for (const ua of DOC_UAS) {
+        try {
+          const r = await fetch(origin + p, { headers: { 'User-Agent': ua }, redirect: 'follow' });
+          await r.arrayBuffer().catch(() => null);
+          if ([401, 403, 406].includes(r.status)) refused.push(`${p} as ${ua} -> ${r.status}`);
+        } catch (e) { errs++; }
+      }
+    }
+    results.push({ name: 'discovery_docs_parity',
+      verdict: refused.length ? 'WEAK' : (found.length === 0 && errs === DOC_PATHS.length ? 'ERROR' : 'PASS'),
+      detail: refused.length
+        ? `the default client reads ${found.join(', ')} but ${refused.join('; ')} — those clients cannot read where this door is advertised`
+        : found.length
+          ? `${found.join(', ')} answer${found.length === 1 ? 's' : ''} 200 to the default client and to ${DOC_UAS.join(' and ')} alike`
+          : errs === DOC_PATHS.length ? 'not observed: none of the three document requests completed'
+          : `none of ${DOC_PATHS.join(', ')} answers 200 on this origin — nothing to compare (a vacuous pass, not evidence)` });
   }
 
   // --- Envelope projections (ported from x402-svm-check, wake 159) ---------
@@ -419,18 +467,34 @@ function termsOf(body, headers) {
           : `all ${bodyTerms.length} advertised option(s) are executable` });
 
       if (hdrEnv && (hdrEnv.accepts || hdrEnv.accepted)) {
-        const h0 = (hdrEnv.accepts || [hdrEnv.accepted])[0];
+        const hdrList = hdrEnv.accepts || [hdrEnv.accepted];
         // 1.7.0: compare the OPTION, not the dialect — a v2 header saying
         // eip155:8453 and a v1 body saying "base" name one chain; a door that
         // serves both versions is dual-serving, which is agreement.
-        const same = h0 && first && h0.scheme === first.scheme && normNet(h0.network) === normNet(first.network) &&
-          String(h0.payTo) === String(first.payTo) &&
-          String(h0.amount || h0.maxAmountRequired) === String(first.amount || first.maxAmountRequired);
-        const dual = same && h0.network !== first.network;
+        // 1.9.0 (2026-09-18): compare the OPTIONS, not their position. A v2
+        // header listing five options beside a v1 body listing one of them is
+        // a door serving two versions; the old rule compared accepts[0] to
+        // accepts[0] and called that a disagreement. Every EXECUTABLE body option must be
+        // in the header; one the header does not carry is still FAIL.
+        const sameOpt = (h, b) => !!h && !!b && h.scheme === b.scheme && normNet(h.network) === normNet(b.network) &&
+          String(h.payTo) === String(b.payTo) &&
+          String(h.amount || h.maxAmountRequired) === String(b.amount || b.maxAmountRequired);
+        // Only options a standard client could execute are compared: an
+        // unexecutable body entry is accepts_all_executable's finding (WEAK),
+        // and this row must not escalate it to FAIL by counting it twice.
+        const cmp = bodyTerms.filter(executable);
+        const orphan = (cmp.length ? cmp : [first]).filter(b => !hdrList.some(h => sameOpt(h, b)));
+        const same = orphan.length === 0;
+        const h0 = hdrList[0];
+        const hm = hdrList.find(h => sameOpt(h, first)) || h0; // the header entry the body's first option matches
+        const dual = same && bodyTerms.some(b => hdrList.some(h => sameOpt(h, b) && h.network !== b.network));
+        const subset = same && hdrList.length !== bodyTerms.length;
         results.push({ name: 'header_body_agree', verdict: same ? 'PASS' : 'FAIL',
-          detail: same ? (dual ? `header (${hdrHow}, ${h0.network}) and body (v${bodyVer || '?'}, ${first.network}) name the same option in two dialects — dual-serving, not a disagreement` : 'header and body advertise the same first payment option')
-            : `header accepts[0] (${h0 ? h0.scheme + '/' + h0.network : 'none'}) and body accepts[0] ` +
-              `(${first ? first.scheme + '/' + first.network : 'none'}) disagree — the two projections of one claim do not match` });
+          detail: same ? (dual ? `header (${hdrHow}, ${hm.network}) and body (v${bodyVer || '?'}, ${first.network}) name the same option in two dialects — dual-serving, not a disagreement`
+              : subset ? `every executable option in the body (${cmp.length} of ${bodyTerms.length}) is also in the header's ${hdrList.length} — the two lists differ in length, not in claim`
+              : 'header and body advertise the same payment options')
+            : `${orphan.length} body option(s) (${orphan.map(b => (b ? b.scheme + '/' + b.network : 'none')).join(', ')}) appear nowhere in the header's ${hdrList.length} option(s) ` +
+              `(header accepts[0] is ${h0 ? h0.scheme + '/' + h0.network : 'none'}) — the two projections of one claim do not match` });
       }
     }
   }
@@ -456,7 +520,7 @@ function termsOf(body, headers) {
     if (!loopback && u.protocol === 'https:') {
       const plain = new URL(url); plain.protocol = 'http:';
       try {
-        const r = await fetch(plain.toString(), { ...reqInit(METHOD, {}, { question: 'x402 plaintext-envelope probe' }), redirect: 'manual' });
+        const r = await fetch(plain.toString(), { ...reqInit(METHOD, {}, PROBE_BODY), redirect: 'manual' });
         const hdr = r.headers.get('payment-required') || r.headers.get('x-payment-required') || '';
         let body = null; try { body = await r.clone().json(); } catch {}
         obs = { ...obs, reachable: true, status: r.status, location: r.headers.get('location') || '',
